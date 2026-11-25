@@ -14,7 +14,6 @@ Submit a **GitHub repository** containing:
 
 Create a file `MISSION_ANSWERS.md` with your answers to all exercises:
 
-```markdown
 # Day 14 Lab - Mission Answers
 
 ## Part 1: Localhost vs Production
@@ -53,15 +52,35 @@ Nên nêu các điểm này khi trả lời phần thảo luận, vì tên gọi
 
 ## Part 2: Docker
 
-### Exercise 2.1: Dockerfile questions
-1. Base image: [Your answer]
-2. Working directory: [Your answer]
-...
+### Exercise 2.1: Dockerfile questions (`02-docker/develop/Dockerfile`)
+1. **Base image:** `python:3.11` bản Python đầy đủ (khoảng 1 GB), có sẵn nhiều công cụ build không cần khi chạy.
+2. **Working directory:** `/app` (đặt bằng `WORKDIR /app`). Các lệnh `COPY`, `RUN`, `CMD` sau đó đều chạy trong thư mục này.
+3. **Tại sao COPY requirements.txt trước:** Docker cache theo từng layer. Copy `requirements.txt` rồi `pip install` trước khi copy code, nên khi chỉ sửa `app.py` thì layer cài dependencies được dùng lại từ cache, build lại nhanh hơn nhiều.
+4. **CMD vs ENTRYPOINT:** `CMD` là lệnh mặc định khi container chạy, có thể bị ghi đè bằng tham số của `docker run`. `ENTRYPOINT` là chương trình cố định luôn chạy; nếu có cả hai thì `CMD` đóng vai trò tham số mặc định cho `ENTRYPOINT`. File này chỉ dùng `CMD ["python", "app.py"]`.
 
-### Exercise 2.3: Image size comparison
-- Develop: [X] MB
-- Production: [Y] MB
-- Difference: [Z]%
+### Exercise 2.2: Build và run (develop)
+Build từ gốc repo: `docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .`
+
+Kết quả gọi container:
+```text
+GET  /health                         → {"status":"ok","uptime_seconds":6.3,"container":true}
+POST /ask?question=What is Docker?   → {"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+```
+
+### Exercise 2.3: Multi-stage build và so sánh kích thước
+- **Stage 1 (builder):** dùng `python:3.11-slim`, cài `gcc`, `libpq-dev` và toàn bộ dependencies bằng `pip install --user`. Stage này chỉ để build, không được deploy.
+- **Stage 2 (runtime):** bắt đầu lại từ `python:3.11-slim` sạch, chỉ copy thư mục packages đã cài (`/root/.local`) và code (`main.py`, `utils/mock_llm.py`), chạy bằng user non-root `appuser`, có `HEALTHCHECK`.
+- **Tại sao image nhỏ hơn:** base `slim` nhỏ hơn nhiều so với bản đầy đủ, và các công cụ build (`gcc`, apt cache, pip cache) nằm lại ở stage 1, không vào image cuối.
+
+Kích thước đo bằng `docker images` (ngày 25/11/2026):
+
+| Image | Kích thước |
+|---|---|
+| `my-agent:develop` | 1.67 GB |
+| `my-agent:advanced` | 240 MB |
+| **Chênh lệch** | **≈ 85.6% nhỏ hơn** (nhỏ hơn khoảng 7 lần) |
+
+Cách tính: (1668 − 240) / 1668 × 100 ≈ 85.6%. Image production đạt yêu cầu < 500 MB.
 
 ## Part 3: Cloud Deployment
 
