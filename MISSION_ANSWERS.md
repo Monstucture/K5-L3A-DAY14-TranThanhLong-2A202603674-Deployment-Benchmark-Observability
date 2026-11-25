@@ -218,9 +218,133 @@ def check_budget(user_id: str, estimated_cost: float) -> bool:
 
 ## Part 5: Scaling & Reliability
 
-### Exercise 5.1-5.5: Implementation notes
-[Your explanations and test results]
+### Exercise 5.1: Health checks (`05-scaling-reliability/develop/app.py`)
+
+Hai endpoint đã có sẵn trong code:
+
+- **`GET /health` — liveness probe** ("process còn sống không?"): luôn trả 200 kèm `status`, `uptime_seconds`, `version`, và kiểm tra bộ nhớ. Nếu endpoint này không trả lời hoặc trả non-200, platform sẽ **restart** container.
+- **`GET /ready` — readiness probe** ("đã nhận traffic được chưa?"): trả 200 khi `_is_ready = True`, trả **503** khi đang khởi động hoặc đang tắt. Load balancer dùng endpoint này để quyết định có **gửi traffic** vào instance hay không, chứ không restart nó.
+
+Kết quả:
+
+```text
+$ curl -i http://localhost:8000/health
+HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":4.7,"version":"1.0.0","environment":"development",
+ "timestamp":"2026-11-25T09:54:45.760693+00:00","checks":{"memory":{"status":"ok","note":"psutil not installed"}}}
+
+$ curl -i http://localhost:8000/ready
+HTTP/1.1 200 OK
+{"ready":true,"in_flight_requests":1}
 ```
+
+(`in_flight_requests: 1` chính là request `/ready` đang được xử lý, vì middleware đếm cả nó.)
+
+**Khác nhau giữa liveness và readiness:** một instance có thể **sống nhưng chưa sẵn sàng** (đang load model, mất kết nối Redis, đang shutdown). Khi đó `/health` vẫn 200 để không bị restart vô ích, còn `/ready` trả 503 để load balancer tạm ngừng gửi request vào.
+
+### Exercise 5.2: Graceful shutdown
+
+**Cách code xử lý:**
+- Middleware `track_requests` đếm số request đang xử lý (`_in_flight_requests`).
+- Khi nhận SIGTERM, uvicorn ngừng nhận request mới và gọi phần shutdown của `lifespan`: đặt `_is_ready = False` (để `/ready` trả 503), rồi chờ các request đang chạy xong (tối đa 30 giây) trước khi thoát.
+
+**Kết quả test** — chạy app trong container Linux để có SIGTERM thật, gửi một request rồi `docker stop` ngay lập tức:
+
+```text
+INFO:     Shutting down
+INFO:     172.17.0.1:52612 - "POST /ask?question=Long%20task HTTP/1.1" 200 OK
+INFO:     Waiting for application shutdown.
+2026-11-25 17:05:19,955 INFO 🔄 Graceful shutdown initiated...
+2026-11-25 17:05:19,955 INFO ✅ Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [214176]
+2026-11-25 17:05:19,955 INFO Received signal 2 — uvicorn will handle graceful shutdown
+```
+
+Request đang chạy vẫn trả **200** sau khi đã bắt đầu "Shutting down", và container thoát với **exit code 0**.
+
+**Phát hiện:** kết quả trên chỉ đúng khi chạy bằng `python app.py`. Nếu chạy bằng lệnh `uvicorn app:app`, hàm `handle_sigterm` của app (đăng ký bằng `signal.signal(SIGTERM, ...)`) **ghi đè** handler của uvicorn: log chỉ in `Received signal 15 — uvicorn will handle graceful shutdown` nhưng uvicorn không bao giờ nhận được tín hiệu, phần shutdown của `lifespan` không chạy, và Docker phải kill process (**exit code 137**). Bài học: không tự đăng ký handler SIGTERM đè lên server, hoặc phải gọi lại handler cũ.
+
+### Exercise 5.3: Stateless design (`05-scaling-reliability/production/app.py`)
+
+- **Anti-pattern:** lưu history trong biến Python (`conversation_history = {}`). Mỗi instance có RAM riêng, nên session tạo ở instance 1 thì instance 2 không biết; restart là mất hết.
+- **Cách làm đúng trong code:** history được lưu trong **Redis** qua `save_session()`, `load_session()`, `append_to_history()`, với key theo `session_id`. Instance nào nhận request cũng đọc/ghi cùng một Redis, nên agent không giữ state trong RAM và có thể scale ra nhiều instance hoặc restart bất kỳ lúc nào.
+- Mỗi response có `served_by` (instance nào trả lời) và `storage: "redis"` để kiểm chứng.
+
+### Exercise 5.4: Load balancing với Nginx
+
+Chạy: `docker compose -p k5-day14-scaling up -d --build --scale agent=3` (stack mở cổng **8080**, endpoint **`POST /chat`**).
+
+```text
+NAME                       STATUS
+k5-day14-scaling-agent-1   Up (healthy)
+k5-day14-scaling-agent-2   Up (healthy)
+k5-day14-scaling-agent-3   Up (healthy)
+k5-day14-scaling-nginx-1   Up
+k5-day14-scaling-redis-1   Up (healthy)
+```
+
+10 request qua Nginx:
+
+```text
+req 1  -> served_by=instance-bc5bcd storage=redis
+req 2  -> served_by=instance-84e6e3 storage=redis
+req 3  -> served_by=instance-bc5bcd storage=redis
+req 4  -> served_by=instance-0e3e9b storage=redis
+req 5  -> served_by=instance-84e6e3 storage=redis
+req 6  -> served_by=instance-bc5bcd storage=redis
+req 7  -> served_by=instance-0e3e9b storage=redis
+req 8  -> served_by=instance-84e6e3 storage=redis
+req 9  -> served_by=instance-bc5bcd storage=redis
+req 10 -> served_by=instance-0e3e9b storage=redis
+```
+
+Đếm trong `docker compose logs agent`: agent-1 nhận 3, agent-2 nhận 4, agent-3 nhận 3 request. Nginx phân tán request đều cho 3 instance (round-robin).
+
+### Exercise 5.5: Test stateless
+
+Kết quả `python test_stateless.py`:
+
+```text
+Session ID: 6614602e-...
+Request 1: [instance-84e6e3]  Q: What is Docker?
+Request 2: [instance-bc5bcd]  Q: Why do we need containers?
+Request 3: [instance-0e3e9b]  Q: What is Kubernetes?
+Request 4: [instance-84e6e3]  Q: How does load balancing work?
+Request 5: [instance-bc5bcd]  Q: What is Redis used for?
+Instances used: {'instance-bc5bcd', 'instance-0e3e9b', 'instance-84e6e3'}
+✅ All requests served despite different instances!
+--- Conversation History ---
+Total messages: 10
+✅ Session history preserved across all instances via Redis!
+```
+
+5 câu hỏi trong cùng một session được 3 instance khác nhau trả lời, nhưng history vẫn đủ 10 message (5 user + 5 assistant), vì history nằm trong Redis chứ không nằm trong RAM của instance nào.
+
+**Thử tắt một instance giữa chừng** (script không tự tắt instance, nên tôi làm thêm bằng tay):
+
+```text
+# Gửi 2 câu trong session, rồi:
+$ docker stop k5-day14-scaling-agent-1
+→ dừng trong 0.7s, exit code 0
+  INFO:     Shutting down
+  INFO:app:Instance instance-0e3e9b shutting down
+  INFO:     Application shutdown complete.
+
+# Gửi tiếp 3 câu cùng session_id
+turn -> served_by=instance-84e6e3 [HTTP 200]
+turn -> served_by=instance-bc5bcd [HTTP 200]
+turn -> served_by=instance-84e6e3 [HTTP 200]
+
+# History của session
+messages: 10   (đủ 5 câu user: 2 trước khi tắt + 3 sau khi tắt)
+```
+
+Khi một instance chết, Nginx chuyển traffic sang 2 instance còn lại, mọi request vẫn trả 200 và cuộc hội thoại không mất gì. Instance bị tắt cũng tắt sạch (exit code 0) khi nhận SIGTERM từ `docker stop`.
+
+(Ghi chú nhỏ: field `turn` trong response bị lệch 1 — câu thứ 3 hiện `turn: 4` — vì code đếm history sau khi đã thêm câu hỏi hiện tại rồi còn cộng 1.)
+
+Dọn stack: `docker compose -p k5-day14-scaling down`.
 
 ---
 
