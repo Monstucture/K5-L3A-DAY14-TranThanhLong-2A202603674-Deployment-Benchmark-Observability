@@ -85,16 +85,129 @@ Cách tính: (1668 − 240) / 1668 × 100 ≈ 85.6%. Image production đạt yê
 ## Part 3: Cloud Deployment
 
 ### Exercise 3.1: Railway deployment
-- URL: https://your-app.railway.app
-- Screenshot: [Link to screenshot in repo]
+- URL: https://lab14deployment-production.up.railway.app/
+- Screenshot: 
+![alt text](image.png)
+
+img on web:
+![alt text](image-1.png)
 
 ## Part 4: API Security
 
-### Exercise 4.1-4.3: Test results
-[Paste your test outputs]
+### Exercise 4.1: API Key authentication (`04-api-gateway/develop/app.py`)
 
-### Exercise 4.4: Cost guard implementation
-[Explain your approach]
+**API key được check ở đâu?** Trong hàm dependency `verify_api_key()`. Header `X-API-Key` được đọc bằng `APIKeyHeader(name="X-API-Key", auto_error=False)`, rồi endpoint `/ask` gắn `Depends(verify_api_key)`. Key đúng được đọc từ biến môi trường `AGENT_API_KEY`.
+
+**Sai key thì sao?** Thiếu header → **401** `Missing API key`. Có header nhưng sai key → **403** `Invalid API key`. Request không tới được LLM.
+
+**Rotate key thế nào?** Key nằm trong biến môi trường, không nằm trong code: đổi giá trị `AGENT_API_KEY` trên server (hoặc trên Railway/Render) rồi restart, báo key mới cho client. Không cần sửa code hay build lại. Muốn rotate không downtime thì cho phép tạm thời 2 key (cũ và mới) trong một khoảng thời gian, rồi bỏ key cũ.
+
+Chạy: `AGENT_API_KEY=secret-key-123 python app.py`. Kết quả `curl -i`:
+
+```text
+# Không có key
+HTTP/1.1 401 Unauthorized
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+
+# Sai key (X-API-Key: wrong-key)
+HTTP/1.1 403 Forbidden
+{"detail":"Invalid API key."}
+
+# Đúng key (X-API-Key: secret-key-123)
+HTTP/1.1 200 OK
+{"question":"Hello","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+### Exercise 4.2: JWT authentication (`04-api-gateway/production/`)
+
+**JWT flow (`auth.py`):**
+1. Client gửi `POST /auth/token` với username/password. `authenticate_user()` kiểm tra với `DEMO_USERS`; sai → 401 `Invalid credentials`.
+2. Server tạo token bằng `create_token()`: payload gồm `sub` (username), `role`, `iat`, `exp` (hết hạn sau 60 phút), ký bằng HS256 với `JWT_SECRET` (đọc từ env).
+3. Client gửi token trong header `Authorization: Bearer <token>` cho mỗi request.
+4. `verify_token()` kiểm tra chữ ký và hạn dùng: thiếu token → 401, hết hạn → 401, token sai/bị sửa → 403. Token hợp lệ thì trả `username` và `role` mà không cần tra database (stateless).
+
+Kết quả (tài khoản `student` / `demo123`, token đã che):
+
+```text
+# Lấy token: POST /auth/token
+{"access_token": "eyJhbGciOiJIUzI1NiIs...", "token_type": "bearer", "expires_in_minutes": 60}
+
+# Sai mật khẩu
+HTTP/1.1 401 Unauthorized
+{"detail":"Invalid credentials"}
+
+# Gọi /ask không có token
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+
+# Gọi /ask có token
+HTTP/1.1 200 OK
+{"question":"Explain JWT","answer":"Đây là câu trả lời từ AI agent (mock). ...","usage":{"requests_remaining":9,"budget_remaining_usd":2.1e-05}}
+```
+
+### Exercise 4.3: Rate limiting (`rate_limiter.py`)
+
+- **Thuật toán:** **Sliding window** (log timestamp). Mỗi user có một `deque` lưu thời điểm các request; mỗi lần gọi thì xoá các timestamp cũ hơn 60 giây, nếu số còn lại ≥ giới hạn thì trả 429.
+- **Giới hạn:** user thường (`role: user`) **10 request / 60 giây**; admin **100 request / 60 giây**.
+- **Bypass cho admin:** `app.py` chọn limiter theo role trong JWT: `rate_limiter_admin if role == "admin" else rate_limiter_user`. Admin (vd tài khoản `teacher`) không bị bỏ qua hoàn toàn, mà dùng limiter riêng với giới hạn cao hơn (100/phút).
+- **Hạn chế:** limiter lưu trong RAM của process, nên khi chạy nhiều instance mỗi instance đếm riêng, restart là mất đếm. Production nên lưu trong Redis.
+
+Kết quả vòng lặp 20 request với cùng token (request "with token" ở 4.2 đã tính là request thứ 1):
+
+```text
+req 1  -> 200   ...   req 9  -> 200   (requests_remaining giảm dần 8 → 0)
+req 10 -> 429 {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":56}}
+req 11 → req 20 -> 429
+
+# Chi tiết một response 429
+HTTP/1.1 429 Too Many Requests
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+retry-after: 53
+{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":53}}
+```
+
+Tổng cộng 10 request thành công trong 60 giây, request thứ 11 trở đi bị chặn với 429 và header `Retry-After` cho biết bao lâu thì gọi lại được.
+
+### Exercise 4.4: Cost guard
+
+**Cách bản có sẵn (`cost_guard.py`) hoạt động:**
+- Mỗi user có một `UsageRecord` theo ngày (input/output tokens, số request). Chi phí tính theo giá GPT-4o-mini: $0.15 / 1M input tokens, $0.60 / 1M output tokens.
+- `check_budget()` chạy **trước** khi gọi LLM: tổng toàn hệ thống ≥ $10/ngày → **503**; user ≥ $1/ngày → **402 Payment Required**; ≥ 80% budget → ghi log cảnh báo.
+- `record_usage()` chạy **sau** khi gọi LLM để cộng token và chi phí.
+- Sau 10 request ở trên: `/me/usage` cho thấy `cost_usd: 0.000188` trên budget `$1.0`.
+
+**Hạn chế:** dữ liệu nằm trong RAM (mất khi restart, không chia sẻ giữa nhiều instance) và reset theo ngày. Ngoài ra field `budget_remaining_usd` trong response của `/ask` thực ra trả về số tiền **đã dùng** (`usage.total_cost_usd`), không phải số còn lại.
+
+**Cách implement theo yêu cầu ($10/tháng mỗi user, lưu trong Redis, reset đầu tháng):**
+
+```python
+import os
+import redis
+from datetime import datetime
+
+r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+MONTHLY_BUDGET_USD = float(os.getenv("MONTHLY_BUDGET_USD", "10"))
+
+def check_budget(user_id: str, estimated_cost: float) -> bool:
+    month_key = datetime.now().strftime("%Y-%m")          # vd "2026-11"
+    key = f"budget:{user_id}:{month_key}"                 # mỗi tháng một key → tự reset đầu tháng
+    current = float(r.get(key) or 0)
+    if current + estimated_cost > MONTHLY_BUDGET_USD:
+        return False                                      # API trả 402
+    r.incrbyfloat(key, estimated_cost)                    # cộng nguyên tử, an toàn khi nhiều instance
+    r.expire(key, 32 * 24 * 3600)                         # tự xoá sau ~1 tháng
+    return True
+```
+
+- **Key theo tháng** (`budget:<user>:<YYYY-MM>`): sang tháng mới là key mới, nên budget tự reset mà không cần cron.
+- **Redis**: mọi instance dùng chung một bộ đếm, restart không mất dữ liệu.
+- **`INCRBYFLOAT`** là lệnh nguyên tử nên nhiều request cùng lúc không ghi đè nhau.
+- **`EXPIRE` 32 ngày** để key cũ tự bị xoá.
+- Lưu ý: bước `GET` rồi `INCRBYFLOAT` chưa hoàn toàn nguyên tử (hai request cùng lúc có thể cùng vượt qua kiểm tra). Muốn chặt chẽ hơn thì dùng Lua script hoặc `INCRBYFLOAT` trước rồi trừ lại nếu vượt.
+
+**Vì sao cần cả rate limit và cost guard:** rate limit chặn gọi **quá nhanh** (bảo vệ server), cost guard chặn **tiêu quá nhiều tiền** theo thời gian dài. Một user gọi đúng 10 request/phút suốt cả ngày vẫn qua được rate limit, nhưng sẽ bị cost guard chặn khi hết budget.
 
 ## Part 5: Scaling & Reliability
 
