@@ -118,6 +118,8 @@ HTTP/1.1 200 OK
 {"question":"Hello","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
 ```
 
+![alt text](image-3.png)
+
 ### Exercise 4.2: JWT authentication (`04-api-gateway/production/`)
 
 **JWT flow (`auth.py`):**
@@ -126,7 +128,7 @@ HTTP/1.1 200 OK
 3. Client gửi token trong header `Authorization: Bearer <token>` cho mỗi request.
 4. `verify_token()` kiểm tra chữ ký và hạn dùng: thiếu token → 401, hết hạn → 401, token sai/bị sửa → 403. Token hợp lệ thì trả `username` và `role` mà không cần tra database (stateless).
 
-Kết quả (tài khoản `student` / `demo123`, token đã che):
+Kết quả (tài khoản `student` / `demo123`):
 
 ```text
 # Lấy token: POST /auth/token
@@ -168,6 +170,8 @@ retry-after: 53
 {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":53}}
 ```
 
+![alt text](image-4.png)
+
 Tổng cộng 10 request thành công trong 60 giây, request thứ 11 trở đi bị chặn với 429 và header `Retry-After` cho biết bao lâu thì gọi lại được.
 
 ### Exercise 4.4: Cost guard
@@ -206,6 +210,9 @@ def check_budget(user_id: str, estimated_cost: float) -> bool:
 - **`INCRBYFLOAT`** là lệnh nguyên tử nên nhiều request cùng lúc không ghi đè nhau.
 - **`EXPIRE` 32 ngày** để key cũ tự bị xoá.
 - Lưu ý: bước `GET` rồi `INCRBYFLOAT` chưa hoàn toàn nguyên tử (hai request cùng lúc có thể cùng vượt qua kiểm tra). Muốn chặt chẽ hơn thì dùng Lua script hoặc `INCRBYFLOAT` trước rồi trừ lại nếu vượt.
+
+**Output:
+{"user_id":"student","date":"2026-11-25","requests":10,"input_tokens":22,"output_tokens":284,"cost_usd":0.000174,"budget_usd":1.0,"budget_remaining_usd":0.999826,"budget_used_pct":0.0}**
 
 **Vì sao cần cả rate limit và cost guard:** rate limit chặn gọi **quá nhanh** (bảo vệ server), cost guard chặn **tiêu quá nhiều tiền** theo thời gian dài. Một user gọi đúng 10 request/phút suốt cả ngày vẫn qua được rate limit, nhưng sẽ bị cost guard chặn khi hết budget.
 
